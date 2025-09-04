@@ -7,25 +7,41 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional, Union, Dict
 
-from utils import parse_xdotool, pause_for_input
-from playwright.async_api import Page, BrowserContext, Keyboard, Mouse
+from utils import keys_mapping
+from playwright.sync_api import Page, BrowserContext, Keyboard, Mouse
+from human_pause import is_challenge_present, wait_for_human, PAUSE_ON_CHALLENGE
 
 
-class BrowserGoalState():
-    pass
+def _kind(v):
+    # Prefer Enum.value when available, else use v
+    val = getattr(v, "value", v)
+    if isinstance(val, str):
+        return val.strip().lower()
+    return str(val).strip().lower()
+    
+@dataclass(frozen=True)
+class BrowserGoalState(str,Enum):
+    INITIAL = "initial"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
 
-class Coordinate():
+@dataclass(frozen=True)
+class Coordinate:
     x:int
     y:int
 
+@dataclass(frozen=True)
 class BrowserViewportDimensions():
     height:int
     width:int
 
+@dataclass(frozen=True)
 class ScrollBar():
     offset:float
     height:float
 
+@dataclass(frozen=True)
 class BrowserTab():
     handle: str
     url: str
@@ -34,7 +50,7 @@ class BrowserTab():
     new: bool
     id: int
 
-
+@dataclass
 class BrowserState():
     screenshot: str
     height: int   ##page.viewport_size, pixels
@@ -44,7 +60,7 @@ class BrowserState():
     active_tab: str
     mouse: Coordinate
 
-
+@dataclass
 class BrowserActionType(str,Enum):
     SUCCESS = "success"
     FAILURE = "failure"
@@ -62,19 +78,20 @@ class BrowserActionType(str,Enum):
     SCROLL_DOWN = "scroll_down"
     SCROLL_UP = "scroll_up"
 
-
+@dataclass(frozen=True)
 class BrowserAction():
     action: BrowserActionType
-    Coordinate: Optional[Coordinate]
+    coordinate: Optional[Coordinate]
     text: Optional[str]
-    resoning: str
+    reasoning: str
     id: str
 
-
+@dataclass(frozen=True)
 class BrowserStep():
     state: BrowserState
     action: BrowserAction
 
+@dataclass(frozen=True)
 class BrowserAgentOptions():
     additional_context:Optional[Union[str,dict[str,Any]]] = None
     additional_instructions:Optional[list[str]] = None
@@ -121,6 +138,8 @@ class BrowserAgent:
         self.history: list[BrowserStep] = []
         # map handle (page.context.pages index or popup) to BrowserTab
         self.tabs: Dict[str, BrowserTab] = {}
+        self._mouse_pos = Coordinate(1, 1)
+        self.pause_on_challenge = getattr(self, "pause_on_challenge", PAUSE_ON_CHALLENGE)
 
         if options:
             if options.additional_context:
@@ -146,6 +165,7 @@ class BrowserAgent:
         screenshot_b64 = screenshot_bytes.encode("base64") if isinstance(screenshot_bytes, str) else screenshot_bytes
         
         mouse = self.get_mouse_position()
+        
         scrollbar = self.get_scroll_position()
 
         # collect tabs from context
@@ -183,12 +203,30 @@ class BrowserAgent:
     def get_scroll_position(self) -> ScrollBar:
         """Get current scroll position as fraction."""
         offset, height = self.page.evaluate(
-            "(window.pageYOffset/document.documentElement.scrollHeight, "
-            "window.innerHeight/document.documentElement.scrollHeight)"
+        "() => [                       \
+            window.pageYOffset / document.documentElement.scrollHeight, \
+            window.innerHeight  / document.documentElement.scrollHeight \
+        ]"
         )
+        # offset, height = self.page.evaluate(
+        #     "(window.pageYOffset/document.documentElement.scrollHeight, "
+        #     "window.innerHeight/document.documentElement.scrollHeight)"
+        # )
         return ScrollBar(offset=offset, height=height)
 
+    def _set_mouse(self, x: int, y: int, clamp_to_viewport: bool = True):
+        if clamp_to_viewport:
+            vw, vh = self.page.evaluate("([window.innerWidth, window.innerHeight])")
+            x = max(0, min(int(x), int(vw) - 1))
+            y = max(0, min(int(y), int(vh) - 1))
+        self._mouse_pos = Coordinate(x, y)
+
     def get_mouse_position(self) -> Coordinate:
+        print("get_mouse_position:")
+        print(self._mouse_pos)
+        return self._mouse_pos
+
+    def get_mouse_position1(self) -> Coordinate:
         """Approximate mouse position via injected listener."""
         # Inject listener
         self.page.evaluate(
@@ -202,9 +240,10 @@ class BrowserAgent:
         )
         # Jiggle the mouse so that listener fires
         self.page.mouse.move(1, 1)
-        self.page.mouse.move(0, 0)
+        # self.page.mouse.move(0, 0)
         time.sleep(0.1)
         last = self.page.evaluate("window._last_mouse")
+        print(last)
         return Coordinate(x=int(last["x"]), y=int(last["y"]))
 
     def get_action(self, current_state: BrowserState) -> BrowserAction:
@@ -220,11 +259,17 @@ class BrowserAgent:
         """Execute an action via Playwright's page, keyboard, and mouse APIs."""
         kb: Keyboard = self.page.keyboard
         m: Mouse = self.page.mouse
-
-        if action.action == BrowserActionType.KEY:
+        
+        if self.pause_on_challenge and is_challenge_present(self.page, timeout_ms=300):
+            res = wait_for_human("执行动作前检测到挑战")
+            if res == "skip":
+                print("[challenge] 用户选择跳过本动作")
+                return
+        
+        if _kind(action.action) == _kind(BrowserActionType.KEY):
             if not action.text:
                 raise ValueError("Text required for key action")
-            strokes = parse_xdotool(action.text)
+            strokes = keys_mapping(action.text)
             for mod in strokes.modifiers:
                 kb.down(mod)
             for k in strokes.keys:
@@ -232,39 +277,42 @@ class BrowserAgent:
             for mod in reversed(strokes.modifiers):
                 kb.up(mod)
 
-        elif action.action == BrowserActionType.TYPE:
+        elif _kind(action.action) == _kind(BrowserActionType.TYPE):
             if not action.text:
                 raise ValueError("Text required for type action")
             kb.type(action.text)
 
-        elif action.action == BrowserActionType.MOUSE_MOVE:
+        elif _kind(action.action) == _kind(BrowserActionType.MOUSE_MOVE):
             if not action.coordinate:
                 raise ValueError("Coordinate required")
+            print("BrowserActionType.MOUSE_MOVE,action.coordinate:")
+            print(action.coordinate)
             m.move(action.coordinate.x, action.coordinate.y)
+            self._set_mouse(action.coordinate.x, action.coordinate.y)
 
-        elif action.action == BrowserActionType.LEFT_CLICK:
+        elif _kind(action.action) == _kind(BrowserActionType.LEFT_CLICK):
             m.click(last_state.mouse.x, last_state.mouse.y)
 
-        elif action.action == BrowserActionType.LEFT_CLICK_DRAG:
+        elif _kind(action.action) == _kind(BrowserActionType.LEFT_CLICK_DRAG):
             if not action.coordinate:
                 raise ValueError("Coordinate required")
             m.down()
             m.move(action.coordinate.x, action.coordinate.y)
             m.up()
 
-        elif action.action == BrowserActionType.RIGHT_CLICK:
+        elif _kind(action.action) == _kind(BrowserActionType.RIGHT_CLICK):
             m.click(last_state.mouse.x, last_state.mouse.y, button="right")
 
-        elif action.action == BrowserActionType.DOUBLE_CLICK:
+        elif _kind(action.action) == _kind(BrowserActionType.DOUBLE_CLICK):
             m.dblclick(last_state.mouse.x, last_state.mouse.y)
 
-        elif action.action == BrowserActionType.SCROLL_DOWN:
+        elif _kind(action.action) == _kind(BrowserActionType.SCROLL_DOWN):
             self.page.mouse.wheel(0, int(3 * last_state.height / 4))
 
-        elif action.action == BrowserActionType.SCROLL_UP:
+        elif _kind(action.action) == _kind(BrowserActionType.SCROLL_UP):
             self.page.mouse.wheel(0, int(-3 * last_state.height / 4))
 
-        elif action.action == BrowserActionType.SWITCH_TAB:
+        elif _kind(action.action) == _kind(BrowserActionType.SWITCH_TAB):
             if not action.text:
                 raise ValueError("Tab id required")
             target = f"tab-{action.text}"
@@ -275,19 +323,27 @@ class BrowserAgent:
         else:
             # SCREENSHOT, CURSOR_POSITION, FAILURE/SUCCESS are no-ops
             pass
+        
+        if self.pause_on_challenge and is_challenge_present(self.page, timeout_ms=300):
+            res = wait_for_human("执行动作后检测到挑战")
+            if res == "skip":
+                print("[challenge] 用户选择跳过后续（本步后）")
 
     def step(self) -> None:
         state = self.get_state()
         action = self.get_action(state)
-
-        if action.action == BrowserActionType.SUCCESS:
+        print("step,get_action result..")
+        print(action)
+        action_kind = _kind(action.action)
+        print(action_kind)
+        if action_kind == "success":            
             self._status = BrowserGoalState.SUCCESS
             return
-        if action.action == BrowserActionType.FAILURE:
+        if action_kind == "failure":            
             self._status = BrowserGoalState.FAILED
             return
-
-        self._status = BrowserGoalState.RUNNING
+        
+        self._status = BrowserGoalState.RUNNING        
         self.take_action(action, state)
         self.history.append(BrowserStep(state=state, action=action))
 
@@ -295,12 +351,29 @@ class BrowserAgent:
         """Begin the automation loop."""
         # prime mouse listener
         self.page.mouse.move(1, 1)
-        while self._status in (BrowserGoalState.INITIAL, BrowserGoalState.RUNNING) and len(self.history) <= self.max_steps:
+        
+               
+        while _kind(self._status) in ('initial', 'running') and len(self.history) <= self.max_steps:
+
             self.step()
+            print("browser.py line358")
+
+            print(self._status)
+            print(_kind(self._status) == "running")
+
             time.sleep(self.wait_after_step_ms / 1000)
-            if self.pause_after_each_action:
-                pause_for_input()
+            # if self.pause_after_each_action:
+            #     pause_for_input()
+        print("browser.py line366")
+        print(self._status)
+        print("Ended")
 
     @property
     def status(self) -> BrowserGoalState:
         return self._status
+
+
+class SimplePlanner(ActionPlanner):
+    def plan_action(self, observation, **kwargs):
+        
+        return {"type": "noop"}
