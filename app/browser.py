@@ -6,12 +6,17 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional, Union, Dict
+from urllib.parse import urlparse
+from typing import Optional,Callable
 
 from utils import keys_mapping
-from playwright.sync_api import Page, BrowserContext, Keyboard, Mouse
-from human_pause import is_challenge_present, wait_for_human, PAUSE_ON_CHALLENGE
+from playwright.sync_api import Page, BrowserContext, Keyboard, Mouse, Error as PWError
+from human_pause import PAUSE_ON_CHALLENGE,pause_if_captcha_then_screenshot
 
-
+def _default_cli_waiter(reason: str = ""):
+    print(f"[HITL] Detected: {reason or 'human intervention required'}")
+    input("After completing in the browser, press Enter to continue...")
+    
 def _kind(v):
     # Prefer Enum.value when available, else use v
     val = getattr(v, "value", v)
@@ -124,6 +129,8 @@ class BrowserAgent:
         action_planner: ActionPlanner,
         goal: str,
         options: Optional[BrowserAgentOptions] = None,
+        wait_for_human: Optional[Callable[[str], None]] = None,
+        on_step: Optional[Callable[[BrowserStep], None]] = None
     ) -> None:
         self.page: Page = page
         self.context: BrowserContext = context
@@ -140,6 +147,16 @@ class BrowserAgent:
         self.tabs: Dict[str, BrowserTab] = {}
         self._mouse_pos = Coordinate(1, 1)
         self.pause_on_challenge = getattr(self, "pause_on_challenge", PAUSE_ON_CHALLENGE)
+        self.wait_for_human = wait_for_human or _default_cli_waiter
+        self.on_step = on_step
+        
+        ### captcha var
+        self._cap_flag = False
+        self._last_side_effect = ""
+        self._page_changing_actions = {"left_click", "right_click", "double_click", "type", "key"}
+        ### captcha probe
+        self._wire_challenge_network_hooks()
+        
 
         if options:
             if options.additional_context:
@@ -156,6 +173,110 @@ class BrowserAgent:
                 self.pause_after_each_action = options.pause_after_each_action
             if options.max_steps:
                 self.max_steps = options.max_steps
+
+    ### Methods for captcha detection
+    def install_challenge_probe(self):
+        if self._cap_probe_installed:
+            return
+        js = """
+        (() => {
+          if (window.__capProbeInstalled) return;
+          window.__capProbeInstalled = true;
+
+          window.__cap = {
+            flag: false, hits: 0, lastHit: 0,
+            sticky: true, autoResetMs: 0,
+            reset() { this.flag=false; this.hits=0; this.lastHit=0; }
+          };
+          const needles=["captcha","hcaptcha","recaptcha","challenge","verify","consent"];
+          const has = s => !!s && needles.some(n => String(s).toLowerCase().includes(n));
+
+          const scanOnce = () => {
+            for (const f of document.querySelectorAll('iframe')) {
+              if (has(f.getAttribute('title')) || has(f.getAttribute('src'))) {
+                window.__cap.flag = true; window.__cap.hits += 1; window.__cap.lastHit = Date.now(); return true;
+              }
+            }
+            const sel = [
+              '[id*="captcha" i]','[class*="captcha" i]','[name*="captcha" i]','[aria-label*="captcha" i]',
+              '[id*="challenge" i]','[class*="challenge" i]','[aria-label*="challenge" i]'
+            ].join(',');
+            const el = document.querySelector(sel);
+            if (el) { window.__cap.flag = true; window.__cap.hits += 1; window.__cap.lastHit = Date.now(); return true; }
+
+            if (!window.__cap.sticky) {
+              window.__cap.flag = false;
+            } else if (window.__cap.autoResetMs > 0 && window.__cap.flag) {
+              const age = Date.now() - (window.__cap.lastHit || 0);
+              if (age >= window.__cap.autoResetMs) window.__cap.flag = false;
+            }
+            return false;
+          };
+
+          try { scanOnce(); } catch {}
+          try {
+            const mo = new MutationObserver(() => { try { scanOnce(); } catch {} });
+            mo.observe(document.documentElement, {
+              subtree:true, childList:true, attributes:true,
+              attributeFilter:["title","src","id","class","name","aria-label"]
+            });
+          } catch {}
+          try { setInterval(() => { try { scanOnce(); } catch {} }, 1000); } catch {}
+        })();
+        """
+        self.context.add_init_script(js)
+        self._cap_probe_installed = True
+
+    def _wire_challenge_network_hooks(self):
+        def on_response(resp):
+            try:
+                u = (resp.url or "").lower()
+                if any(k in u for k in ("captcha","hcaptcha","recaptcha","/sorry","/challenge")):
+                    self._cap_flag = True
+                    self._last_side_effect = "[challenge] detected via network"
+            except Exception:
+                pass
+        self.context.on("response", on_response)
+
+    def _safe_eval_flag(self, budget_ms: int = 250):
+        """
+        Try to read window.__cap.flag with a short retry loop.
+        Returns True/False on success, or None if not readable within budget.
+        Never raises; swallows 'Execution context was destroyed' during nav.
+        """
+        deadline = time.monotonic() + budget_ms / 1000.0
+        while time.monotonic() < deadline:
+            try:
+                return self.page.evaluate(
+                    "window.__cap ? Boolean(window.__cap.flag) : false"
+                )
+            except PWError as e:
+                # Navigation / context destroyed / target closed -> brief retry
+                msg = str(e)
+                if ("Execution context was destroyed" in msg) or ("Target closed" in msg):
+                    time.sleep(0.05)  # 50 ms
+                    continue
+                # Any other Playwright error: stop retrying
+                break
+            except Exception:
+                # Non-Playwright error: stop retrying
+                break
+        return None  # give up for now
+    
+    # ✅ 检查 captcha 状态
+    def quick_challenge_flag(self, budget_ms: int = 250) -> bool:
+        return bool(getattr(self, "_cap_flag", False))
+
+    # （可选）辅助方法：只在高风险域名上读一次 flag
+    def maybe_check_challenge(self, reason: str) -> bool:
+        return self.quick_challenge_flag()
+
+    # （可选）人工完成后复位
+    def reset_challenge_flag(self):
+        self._cap_flag = False
+        self._last_side_effect = "[human] challenge resolved"
+        
+    ### Methods for captcha detection ends
 
     def get_state(self) -> BrowserState:
         """Get current browser state via Playwright."""
@@ -260,13 +381,9 @@ class BrowserAgent:
         kb: Keyboard = self.page.keyboard
         m: Mouse = self.page.mouse
         
-        if self.pause_on_challenge and is_challenge_present(self.page, timeout_ms=300):
-            res = wait_for_human("执行动作前检测到挑战")
-            if res == "skip":
-                print("[challenge] 用户选择跳过本动作")
-                return
+        action_kind = _kind(action.action)
         
-        if _kind(action.action) == _kind(BrowserActionType.KEY):
+        if action_kind == _kind(BrowserActionType.KEY):
             if not action.text:
                 raise ValueError("Text required for key action")
             strokes = keys_mapping(action.text)
@@ -277,12 +394,12 @@ class BrowserAgent:
             for mod in reversed(strokes.modifiers):
                 kb.up(mod)
 
-        elif _kind(action.action) == _kind(BrowserActionType.TYPE):
+        elif action_kind == _kind(BrowserActionType.TYPE):
             if not action.text:
                 raise ValueError("Text required for type action")
             kb.type(action.text)
 
-        elif _kind(action.action) == _kind(BrowserActionType.MOUSE_MOVE):
+        elif action_kind == _kind(BrowserActionType.MOUSE_MOVE):
             if not action.coordinate:
                 raise ValueError("Coordinate required")
             print("BrowserActionType.MOUSE_MOVE,action.coordinate:")
@@ -290,29 +407,29 @@ class BrowserAgent:
             m.move(action.coordinate.x, action.coordinate.y)
             self._set_mouse(action.coordinate.x, action.coordinate.y)
 
-        elif _kind(action.action) == _kind(BrowserActionType.LEFT_CLICK):
+        elif action_kind == _kind(BrowserActionType.LEFT_CLICK):
             m.click(last_state.mouse.x, last_state.mouse.y)
 
-        elif _kind(action.action) == _kind(BrowserActionType.LEFT_CLICK_DRAG):
+        elif action_kind == _kind(BrowserActionType.LEFT_CLICK_DRAG):
             if not action.coordinate:
                 raise ValueError("Coordinate required")
             m.down()
             m.move(action.coordinate.x, action.coordinate.y)
             m.up()
 
-        elif _kind(action.action) == _kind(BrowserActionType.RIGHT_CLICK):
+        elif action_kind == _kind(BrowserActionType.RIGHT_CLICK):
             m.click(last_state.mouse.x, last_state.mouse.y, button="right")
 
-        elif _kind(action.action) == _kind(BrowserActionType.DOUBLE_CLICK):
+        elif action_kind == _kind(BrowserActionType.DOUBLE_CLICK):
             m.dblclick(last_state.mouse.x, last_state.mouse.y)
 
-        elif _kind(action.action) == _kind(BrowserActionType.SCROLL_DOWN):
+        elif action_kind == _kind(BrowserActionType.SCROLL_DOWN):
             self.page.mouse.wheel(0, int(3 * last_state.height / 4))
 
-        elif _kind(action.action) == _kind(BrowserActionType.SCROLL_UP):
+        elif action_kind == _kind(BrowserActionType.SCROLL_UP):
             self.page.mouse.wheel(0, int(-3 * last_state.height / 4))
 
-        elif _kind(action.action) == _kind(BrowserActionType.SWITCH_TAB):
+        elif action_kind == _kind(BrowserActionType.SWITCH_TAB):
             if not action.text:
                 raise ValueError("Tab id required")
             target = f"tab-{action.text}"
@@ -324,11 +441,10 @@ class BrowserAgent:
             # SCREENSHOT, CURSOR_POSITION, FAILURE/SUCCESS are no-ops
             pass
         
-        if self.pause_on_challenge and is_challenge_present(self.page, timeout_ms=300):
-            res = wait_for_human("执行动作后检测到挑战")
-            if res == "skip":
-                print("[challenge] 用户选择跳过后续（本步后）")
-
+        if action_kind in self._page_changing_actions:
+            _ = self.maybe_check_challenge(f"after {action_kind}")
+        
+        
     def step(self) -> None:
         state = self.get_state()
         action = self.get_action(state)
@@ -345,7 +461,16 @@ class BrowserAgent:
         
         self._status = BrowserGoalState.RUNNING        
         self.take_action(action, state)
-        self.history.append(BrowserStep(state=state, action=action))
+        pause_if_captcha_then_screenshot(self.page,self.wait_for_human)
+        step_obj = BrowserStep(state=state, action=action)
+        # self.history.append(BrowserStep(state=state, action=action))
+        self.history.append(step_obj)
+        
+        if self.on_step:
+            try:
+                self.on_step(step_obj)
+            except Exception:
+                pass
 
     def start(self) -> None:
         """Begin the automation loop."""
