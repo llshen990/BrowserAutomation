@@ -1,11 +1,12 @@
 from browser import BrowserAgent, BrowserActionType
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 from PIL import Image
 from io import BytesIO
-from browser import BrowserAgent,ActionPlanner,SimplePlanner
+from browser import BrowserAgent,ActionPlanner
 from anthropicAgent import AnthropicPlanner
 import os
 import time
+import asyncio
 
 def main1():
     with sync_playwright() as p:
@@ -31,23 +32,23 @@ def main1():
         print(status1)
 
 
-def main():
+async def main():
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False)
-            context = browser.new_context()
-            page = context.new_page()
-            goal1="give me the wikipedia page of MCP"
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False)
+            context = await browser.new_context()
+            page = await context.new_page()
+            goal1="give me the wikipedia page of React"
 
             ba = BrowserAgent(page=page,context=context,action_planner=AnthropicPlanner(),goal=goal1)
-            ba.page.goto("https://google.com")
+            await ba.page.goto("https://bing.com")
             # bs=ba.get_state()
-            ba.start()
+            await ba.start()
     finally:
         time.sleep(5)
-        browser.close()
+        await browser.close()
 
 if __name__ == "__main__":
     
-    main()
+    asyncio.run(main())
 

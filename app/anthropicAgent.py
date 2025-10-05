@@ -161,6 +161,7 @@ class AnthropicPlanner(ActionPlanner):
         )
         
         if msgOptions.screenshot:
+            print("screenshot True,will save screenshot")
             # screenshot_buffer = base64.b64decode(browserstate.screenshot)
             screenshot_buffer = browserstate.screenshot
             resized = self.screenshot_conversion(screenshot_buffer,browserstate)
@@ -367,7 +368,8 @@ The user will ask you to perform a task and you should use their browser to do s
             max_tokens=self.max_tokens,
             messages=messages,
             tools=tools,
-            betas=self.beta_flag         
+            betas=self.beta_flag,
+            service_tier="auto"         
         )
         print(
             f"Token usage - Input: {response.usage.input_tokens}, Output: {response.usage.output_tokens}"
@@ -379,7 +381,7 @@ The user will ask you to perform a task and you should use their browser to do s
         )
 
         action = self.parse_action(response, scaling, current_state)
-        print(action)
+        
 
         return action
 

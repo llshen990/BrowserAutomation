@@ -1,28 +1,128 @@
-# browser_playwright.py
-
+import asyncio
 import json
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional, Union, Dict
+from typing import Any, Optional, Union, Dict, Callable
 from urllib.parse import urlparse
-from typing import Optional,Callable
 
-from utils import keys_mapping
-from playwright.sync_api import Page, BrowserContext, Keyboard, Mouse, Error as PWError
-from human_pause import PAUSE_ON_CHALLENGE,pause_if_captcha_then_screenshot
+from utils import keys_mapping,read_with_retry,screenshot_with_retry,_safe_eval
+from utils import (
+    safe_click_at, safe_key, safe_scroll,
+    switch_to_page, safe_go_back, safe_go_forward
+)
+from playwright.async_api import Page, BrowserContext, Keyboard, Mouse, Error as PWError
+from human_pause import PAUSE_ON_CHALLENGE, pause_if_captcha_then_screenshot,detect_captcha_quick
 
-def _default_cli_waiter(reason: str = ""):
+_CAP_KWS = ("captcha","hcaptcha","recaptcha","cloudflare","cf-chl","are you a robot","human verification","challenge","verify")
+
+def _looks_like_captcha(text: str | None) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(k in t for k in _CAP_KWS)
+
+   
+async def _default_cli_waiter_async(reason: str = ""):
     print(f"[HITL] Detected: {reason or 'human intervention required'}")
-    input("After completing in the browser, press Enter to continue...")
+    # input("After completing in the browser, press Enter to continue...")
+    await asyncio.to_thread(input, "After completing in the browser, press Enter to continue...")
     
+class HITLPause(Exception):
+    """Used to signal that human input is required to proceed."""
+    pass
+
 def _kind(v):
     # Prefer Enum.value when available, else use v
     val = getattr(v, "value", v)
     if isinstance(val, str):
         return val.strip().lower()
     return str(val).strip().lower()
+    
+# async def _dom_signature(page):
+#     # URL + 文本长度，足够轻量也能反映“页面是否变了”
+#     try:
+#         return await page.evaluate("() => location.href + '|' + (document.body?.innerText?.length||0)")
+#     except Exception:
+#         return page.url + "|?"
+
+# async def _maybe_scroll_into_view(page, x, y):
+#     vp = await page.evaluate("() => ({w: innerWidth, h: innerHeight, sx: scrollX, sy: scrollY})")
+#     if not (0 <= x < vp["w"] and 0 <= y < vp["h"]):
+#         await page.evaluate(
+#             "([x,y,sy]) => window.scrollTo({top: Math.max(0, y + sy - innerHeight/2), behavior:'instant'})",
+#             [x, y, vp["sy"]],
+#         )
+
+# async def _probe_point(page, x, y):
+#     js = """
+#     ([x,y]) => {
+#     const el = document.elementFromPoint(x,y);
+#     if (!el) return null;
+#     const cs = getComputedStyle(el);
+#     const visible = cs && cs.visibility!=='hidden' && cs.display!=='none' && parseFloat(cs.opacity||'1')>0.01;
+#     const pe = cs && cs.pointerEvents!=='none';
+#     const a = el.closest('a[href], [role="link"][href]');
+#     const submit = el.closest('button[type="submit"], input[type="submit"]');
+#     const newTab = a && (a.target==='_blank' || a.rel?.includes('noopener'));
+#     return { visible, pe, navLikely: !!(a||submit), popupLikely: !!newTab };
+#     }
+#     """
+#     return await page.evaluate(js, [x, y])
+
+# async def safe_click_at(page, x: int, y: int, nav_timeout=10000):
+#     # 记录点击前的页面特征
+#     before = await _dom_signature(page)
+
+#     # 仅在必要时把目标滚进视口
+#     await _maybe_scroll_into_view(page, x, y)
+
+#     # 目标探测（避免点空/被遮挡）
+#     info = await _probe_point(page, x, y)
+#     if not info or not (info["visible"] and info["pe"]):
+#         # 轻等一会儿再测一次，给布局个稳定机会
+#         await asyncio.sleep(0.12)
+#         info = await _probe_point(page, x, y)
+#         if not info or not (info["visible"] and info["pe"]):
+#             return False  # 不盲点，让上层决定是否重试/改策略
+
+#     try:
+#         # 可能弹新页
+#         if info.get("popupLikely"):
+#             async with page.expect_popup() as p:
+#                 await page.mouse.click(int(x), int(y))
+#             newp = await p.value
+#             await newp.wait_for_load_state("domcontentloaded")
+#             # 如果你有 BrowserAgent，记得把 self.page = newp
+#             return True
+
+#         # 可能发生导航（当前页）
+#         if info.get("navLikely"):
+#             async with page.expect_navigation(wait_until="domcontentloaded", timeout=nav_timeout):
+#                 await page.mouse.click(int(x), int(y))
+#             return True
+
+#         # 非导航点击：执行 + 微沉淀
+#         await page.mouse.click(int(x), int(y))
+#         await asyncio.sleep(0.05)
+
+#     except PWError as e:
+#         msg = str(e).lower()
+#         if "execution context was destroyed" in msg or "navigat" in msg:
+#             # 导航竞态：等新文档 ready 再判断一次
+#             try:
+#                 await page.wait_for_load_state("domcontentloaded", timeout=5000)
+#             except Exception:
+#                 pass
+#         else:
+#             raise
+
+#     # 点击后兜底判断：即使没有触发导航事件，但 URL/DOM 可能已经变了（SPA/同文档）
+#     after = await _dom_signature(page)
+#     if after != before:
+#         return True  # 视为成功（同文档路由/动态更新等）
+#     return True  # 或者根据你的需要返回 False；这里返回 True 表示点击已完成但未导航
     
 @dataclass(frozen=True)
 class BrowserGoalState(str,Enum):
@@ -120,8 +220,6 @@ class ActionPlanner(ABC):
 
 
 class BrowserAgent:
-    """Playwright-based agent class for browser automation."""
-
     def __init__(
         self,
         page: Page,
@@ -132,31 +230,26 @@ class BrowserAgent:
         wait_for_human: Optional[Callable[[str], None]] = None,
         on_step: Optional[Callable[[BrowserStep], None]] = None
     ) -> None:
-        self.page: Page = page
-        self.context: BrowserContext = context
+        self.page = page
+        self.context = context
         self.planner = action_planner
         self.goal = goal
         self.additional_context = "None"
-        self.additional_instructions: list[str] = []
+        self.additional_instructions = []
         self.wait_after_step_ms = 500
         self.pause_after_each_action = False
         self.max_steps = 50
         self._status = BrowserGoalState.INITIAL
         self.history: list[BrowserStep] = []
-        # map handle (page.context.pages index or popup) to BrowserTab
         self.tabs: Dict[str, BrowserTab] = {}
         self._mouse_pos = Coordinate(1, 1)
         self.pause_on_challenge = getattr(self, "pause_on_challenge", PAUSE_ON_CHALLENGE)
-        self.wait_for_human = wait_for_human or _default_cli_waiter
+        self.wait_for_human = wait_for_human or _default_cli_waiter_async
         self.on_step = on_step
-        
-        ### captcha var
         self._cap_flag = False
         self._last_side_effect = ""
         self._page_changing_actions = {"left_click", "right_click", "double_click", "type", "key"}
-        ### captcha probe
-        self._wire_challenge_network_hooks()
-        
+        # self._wire_challenge_network_hooks()
 
         if options:
             if options.additional_context:
@@ -173,128 +266,28 @@ class BrowserAgent:
                 self.pause_after_each_action = options.pause_after_each_action
             if options.max_steps:
                 self.max_steps = options.max_steps
-
-    ### Methods for captcha detection
-    def install_challenge_probe(self):
-        if self._cap_probe_installed:
-            return
-        js = """
-        (() => {
-          if (window.__capProbeInstalled) return;
-          window.__capProbeInstalled = true;
-
-          window.__cap = {
-            flag: false, hits: 0, lastHit: 0,
-            sticky: true, autoResetMs: 0,
-            reset() { this.flag=false; this.hits=0; this.lastHit=0; }
-          };
-          const needles=["captcha","hcaptcha","recaptcha","challenge","verify","consent"];
-          const has = s => !!s && needles.some(n => String(s).toLowerCase().includes(n));
-
-          const scanOnce = () => {
-            for (const f of document.querySelectorAll('iframe')) {
-              if (has(f.getAttribute('title')) || has(f.getAttribute('src'))) {
-                window.__cap.flag = true; window.__cap.hits += 1; window.__cap.lastHit = Date.now(); return true;
-              }
-            }
-            const sel = [
-              '[id*="captcha" i]','[class*="captcha" i]','[name*="captcha" i]','[aria-label*="captcha" i]',
-              '[id*="challenge" i]','[class*="challenge" i]','[aria-label*="challenge" i]'
-            ].join(',');
-            const el = document.querySelector(sel);
-            if (el) { window.__cap.flag = true; window.__cap.hits += 1; window.__cap.lastHit = Date.now(); return true; }
-
-            if (!window.__cap.sticky) {
-              window.__cap.flag = false;
-            } else if (window.__cap.autoResetMs > 0 && window.__cap.flag) {
-              const age = Date.now() - (window.__cap.lastHit || 0);
-              if (age >= window.__cap.autoResetMs) window.__cap.flag = false;
-            }
-            return false;
-          };
-
-          try { scanOnce(); } catch {}
-          try {
-            const mo = new MutationObserver(() => { try { scanOnce(); } catch {} });
-            mo.observe(document.documentElement, {
-              subtree:true, childList:true, attributes:true,
-              attributeFilter:["title","src","id","class","name","aria-label"]
-            });
-          } catch {}
-          try { setInterval(() => { try { scanOnce(); } catch {} }, 1000); } catch {}
-        })();
-        """
-        self.context.add_init_script(js)
-        self._cap_probe_installed = True
-
-    def _wire_challenge_network_hooks(self):
-        def on_response(resp):
-            try:
-                u = (resp.url or "").lower()
-                if any(k in u for k in ("captcha","hcaptcha","recaptcha","/sorry","/challenge")):
-                    self._cap_flag = True
-                    self._last_side_effect = "[challenge] detected via network"
-            except Exception:
-                pass
-        self.context.on("response", on_response)
-
-    def _safe_eval_flag(self, budget_ms: int = 250):
-        """
-        Try to read window.__cap.flag with a short retry loop.
-        Returns True/False on success, or None if not readable within budget.
-        Never raises; swallows 'Execution context was destroyed' during nav.
-        """
-        deadline = time.monotonic() + budget_ms / 1000.0
-        while time.monotonic() < deadline:
-            try:
-                return self.page.evaluate(
-                    "window.__cap ? Boolean(window.__cap.flag) : false"
-                )
-            except PWError as e:
-                # Navigation / context destroyed / target closed -> brief retry
-                msg = str(e)
-                if ("Execution context was destroyed" in msg) or ("Target closed" in msg):
-                    time.sleep(0.05)  # 50 ms
-                    continue
-                # Any other Playwright error: stop retrying
-                break
-            except Exception:
-                # Non-Playwright error: stop retrying
-                break
-        return None  # give up for now
+                
+    @property
+    def status(self) -> "BrowserGoalState":
+        """只读状态（RUNNING / SUCCESS / FAILED）"""
+        return _kind(self._status)
     
-    # ✅ 检查 captcha 状态
-    def quick_challenge_flag(self, budget_ms: int = 250) -> bool:
-        return bool(getattr(self, "_cap_flag", False))
-
-    # （可选）辅助方法：只在高风险域名上读一次 flag
-    def maybe_check_challenge(self, reason: str) -> bool:
-        return self.quick_challenge_flag()
-
-    # （可选）人工完成后复位
-    def reset_challenge_flag(self):
-        self._cap_flag = False
-        self._last_side_effect = "[human] challenge resolved"
-        
-    ### Methods for captcha detection ends
-
-    def get_state(self) -> BrowserState:
-        """Get current browser state via Playwright."""
+    async def get_state(self) -> BrowserState:
         viewport = self.page.viewport_size
-        # Playwright returns bytes; encode to base64 for consistency
-        screenshot_bytes = self.page.screenshot(full_page=False)
-        screenshot_b64 = screenshot_bytes.encode("base64") if isinstance(screenshot_bytes, str) else screenshot_bytes
-        
-        mouse = self.get_mouse_position()
-        
-        scrollbar = self.get_scroll_position()
+        await self.page.wait_for_load_state("domcontentloaded")
+        await self.page.wait_for_timeout(100)
+        # screenshot_bytes = await self.page.screenshot(full_page=False)
+        screenshot_bytes = await screenshot_with_retry(self.page,full_page=False)
+        mouse = await self.get_mouse_position()
+        scrollbar = await self.get_scroll_position()
 
-        # collect tabs from context
         browser_tabs = []
         pages = self.context.pages
         for idx, pg in enumerate(pages):
             url = pg.url
-            title = pg.title()
+            
+            # title = await pg.title()
+            title = await read_with_retry(pg, pg.title)
             active = pg == self.page
             is_new = False
             handle = f"tab-{idx}"
@@ -312,7 +305,7 @@ class BrowserAgent:
             browser_tabs.append(tab)
 
         return BrowserState(
-            screenshot=screenshot_b64,
+            screenshot=screenshot_bytes,
             height=viewport["height"],
             width=viewport["width"],
             scrollbar=scrollbar,
@@ -321,184 +314,136 @@ class BrowserAgent:
             mouse=mouse,
         )
 
-    def get_scroll_position(self) -> ScrollBar:
-        """Get current scroll position as fraction."""
-        offset, height = self.page.evaluate(
-        "() => [                       \
-            window.pageYOffset / document.documentElement.scrollHeight, \
-            window.innerHeight  / document.documentElement.scrollHeight \
-        ]"
-        )
-        # offset, height = self.page.evaluate(
-        #     "(window.pageYOffset/document.documentElement.scrollHeight, "
-        #     "window.innerHeight/document.documentElement.scrollHeight)"
+    async def get_scroll_position(self) -> ScrollBar:
+        # offset, height = await self.page.evaluate(
+        #     "() => [window.pageYOffset / document.documentElement.scrollHeight, window.innerHeight / document.documentElement.scrollHeight]"
         # )
+        offset, height = await _safe_eval(self.page,
+            "() => [window.pageYOffset / document.documentElement.scrollHeight, window.innerHeight / document.documentElement.scrollHeight]"
+        )
         return ScrollBar(offset=offset, height=height)
 
-    def _set_mouse(self, x: int, y: int, clamp_to_viewport: bool = True):
-        if clamp_to_viewport:
-            vw, vh = self.page.evaluate("([window.innerWidth, window.innerHeight])")
-            x = max(0, min(int(x), int(vw) - 1))
-            y = max(0, min(int(y), int(vh) - 1))
-        self._mouse_pos = Coordinate(x, y)
-
-    def get_mouse_position(self) -> Coordinate:
-        print("get_mouse_position:")
-        print(self._mouse_pos)
+    async def get_mouse_position(self) -> Coordinate:
         return self._mouse_pos
 
-    def get_mouse_position1(self) -> Coordinate:
-        """Approximate mouse position via injected listener."""
-        # Inject listener
-        self.page.evaluate(
-            """
-            window._last_mouse = {x:0,y:0};
-            document.addEventListener('mousemove', e => {
-                window._last_mouse.x = e.clientX;
-                window._last_mouse.y = e.clientY;
-            });
-            """
-        )
-        # Jiggle the mouse so that listener fires
-        self.page.mouse.move(1, 1)
-        # self.page.mouse.move(0, 0)
-        time.sleep(0.1)
-        last = self.page.evaluate("window._last_mouse")
-        print(last)
-        return Coordinate(x=int(last["x"]), y=int(last["y"]))
-
-    def get_action(self, current_state: BrowserState) -> BrowserAction:
+    def get_action(self, state: BrowserState) -> BrowserAction:
         return self.planner.plan_action(
-            self.goal,
-            self.additional_context,
-            self.additional_instructions,
-            current_state,
-            self.history,
+            goal=self.goal,
+            current_state=state,
+            session_history=self.history,
+            additional_context=self.additional_context,
+            additional_instructions=self.additional_instructions,
         )
-
-    def take_action(self, action: BrowserAction, last_state: BrowserState) -> None:
-        """Execute an action via Playwright's page, keyboard, and mouse APIs."""
+    async def take_action(self, action: BrowserAction, last_state: BrowserState) -> None:
         kb: Keyboard = self.page.keyboard
         m: Mouse = self.page.mouse
-        
         action_kind = _kind(action.action)
-        
+
         if action_kind == _kind(BrowserActionType.KEY):
             if not action.text:
                 raise ValueError("Text required for key action")
             strokes = keys_mapping(action.text)
             for mod in strokes.modifiers:
-                kb.down(mod)
+                await kb.down(mod)
             for k in strokes.keys:
-                kb.press(k)
+                # await kb.press(k)
+                await safe_key(self.page, k)
             for mod in reversed(strokes.modifiers):
-                kb.up(mod)
+                await kb.up(mod)
 
         elif action_kind == _kind(BrowserActionType.TYPE):
             if not action.text:
                 raise ValueError("Text required for type action")
-            kb.type(action.text)
+            await kb.type(action.text)
 
         elif action_kind == _kind(BrowserActionType.MOUSE_MOVE):
             if not action.coordinate:
                 raise ValueError("Coordinate required")
-            print("BrowserActionType.MOUSE_MOVE,action.coordinate:")
-            print(action.coordinate)
-            m.move(action.coordinate.x, action.coordinate.y)
-            self._set_mouse(action.coordinate.x, action.coordinate.y)
+            await m.move(action.coordinate.x, action.coordinate.y)
+            print("mouse moved to..", action.coordinate)
+            self._mouse_pos = Coordinate(action.coordinate.x, action.coordinate.y)
 
         elif action_kind == _kind(BrowserActionType.LEFT_CLICK):
-            m.click(last_state.mouse.x, last_state.mouse.y)
-
-        elif action_kind == _kind(BrowserActionType.LEFT_CLICK_DRAG):
-            if not action.coordinate:
-                raise ValueError("Coordinate required")
-            m.down()
-            m.move(action.coordinate.x, action.coordinate.y)
-            m.up()
-
-        elif action_kind == _kind(BrowserActionType.RIGHT_CLICK):
-            m.click(last_state.mouse.x, last_state.mouse.y, button="right")
-
-        elif action_kind == _kind(BrowserActionType.DOUBLE_CLICK):
-            m.dblclick(last_state.mouse.x, last_state.mouse.y)
+            print("last step mouse position:",self._mouse_pos)
+            print("to left_click at", last_state.mouse)
+            # await m.click(last_state.mouse.x, last_state.mouse.y)
+            await safe_click_at(self.page, last_state.mouse.x, last_state.mouse.y)
 
         elif action_kind == _kind(BrowserActionType.SCROLL_DOWN):
-            self.page.mouse.wheel(0, int(3 * last_state.height / 4))
+            # await self.page.mouse.wheel(0, int(3 * last_state.height / 4))
+            dy = int(0.75 * last_state.height)            # 和你之前等量
+            await safe_scroll(self.page, dy)
 
         elif action_kind == _kind(BrowserActionType.SCROLL_UP):
-            self.page.mouse.wheel(0, int(-3 * last_state.height / 4))
+            # await self.page.mouse.wheel(0, int(-3 * last_state.height / 4))
+            dy = -int(0.75 * last_state.height)
+            await safe_scroll(self.page, dy)
 
         elif action_kind == _kind(BrowserActionType.SWITCH_TAB):
             if not action.text:
                 raise ValueError("Tab id required")
-            target = f"tab-{action.text}"
-            pages = self.context.pages
             idx = int(action.text)
-            self.page = pages[idx]
+            # self.page = self.context.pages[idx]
+            newp = await switch_to_page(self.context, target_index=idx)
+            if newp:
+                self.page = newp
 
-        else:
-            # SCREENSHOT, CURSOR_POSITION, FAILURE/SUCCESS are no-ops
-            pass
-        
-        if action_kind in self._page_changing_actions:
-            _ = self.maybe_check_challenge(f"after {action_kind}")
-        
-        
-    def step(self) -> None:
-        state = self.get_state()
+    async def step(self) -> None:
+        state = await self.get_state()
         action = self.get_action(state)
-        print("step,get_action result..")
-        print(action)
+        print("in step,Next action:", action)
         action_kind = _kind(action.action)
-        print(action_kind)
-        if action_kind == "success":            
+        print("in step:action_kind:", action_kind)
+
+        if action_kind == "success":
             self._status = BrowserGoalState.SUCCESS
             return
-        if action_kind == "failure":            
+        if action_kind == "failure":
+            if self.pause_on_challenge and (_looks_like_captcha(action.reasoning)  or await detect_captcha_quick(self.page) ):
+                try:
+                    self.history.append(BrowserStep(state=state, action=action))
+                except Exception:
+                    pass
+                await self.wait_for_human("CAPTCHA reported by model or detected on page")
+                return
             self._status = BrowserGoalState.FAILED
             return
-        
-        self._status = BrowserGoalState.RUNNING        
-        self.take_action(action, state)
-        pause_if_captcha_then_screenshot(self.page,self.wait_for_human)
+
+        self._status = BrowserGoalState.RUNNING
+        await self.take_action(action, state)
+        # await pause_if_captcha_then_screenshot(self.page, self.wait_for_human)
+        # pause_if_captcha_then_screenshot(self.page, self.wait_for_human)
         step_obj = BrowserStep(state=state, action=action)
-        # self.history.append(BrowserStep(state=state, action=action))
         self.history.append(step_obj)
-        
+
         if self.on_step:
             try:
-                self.on_step(step_obj)
+                await self.on_step(step_obj)
             except Exception:
                 pass
+    
 
-    def start(self) -> None:
+    async def start(self) -> None:
         """Begin the automation loop."""
         # prime mouse listener
-        self.page.mouse.move(1, 1)
-        
-               
+        await self.page.mouse.move(1, 1)
+
         while _kind(self._status) in ('initial', 'running') and len(self.history) <= self.max_steps:
+            await self.step()
+            print("in start, after step(),self._status:",self._status)
+            print("in start,self._mouse_pos:",self._mouse_pos)
+            
 
-            self.step()
-            print("browser.py line358")
+            await asyncio.sleep(self.wait_after_step_ms / 1000)
 
-            print(self._status)
-            print(_kind(self._status) == "running")
-
-            time.sleep(self.wait_after_step_ms / 1000)
+            # Optional pause after each step
             # if self.pause_after_each_action:
-            #     pause_for_input()
-        print("browser.py line366")
-        print(self._status)
-        print("Ended")
+            #     await self.pause_for_input()  # Make sure pause_for_input is also async
+
+        
+
+
 
     @property
     def status(self) -> BrowserGoalState:
         return self._status
-
-
-class SimplePlanner(ActionPlanner):
-    def plan_action(self, observation, **kwargs):
-        
-        return {"type": "noop"}

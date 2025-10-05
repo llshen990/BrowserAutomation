@@ -2,6 +2,8 @@
 import os, sys, time, platform
 from typing import List, Optional
 from playwright.sync_api import TimeoutError as PWTimeoutError, Error as PWError,Page
+import asyncio
+_CAP_PATTERNS = ("captcha", "hcaptcha", "recaptcha", "challenge", "verify", "/sorry", "cloudflare", "cf-chl")
 
 # 开关 & 超时，支持环境变量
 PAUSE_ON_CHALLENGE = os.getenv("PAUSE_ON_CHALLENGE", "1") == "1"
@@ -180,7 +182,7 @@ def _read_key_nonblock(timeout_s: int) -> Optional[str]:
             return sys.stdin.readline().rstrip("\n")
         return None
 
-def wait_for_human(reason: str, timeout_s: int = HUMAN_PAUSE_TIMEOUT) -> str:
+def wait_for_human0(reason: str, timeout_s: int = HUMAN_PAUSE_TIMEOUT) -> str:
     """
     停下等待人工处理。
     - 回车/空输入：继续
@@ -211,3 +213,40 @@ def wait_for_human(reason: str, timeout_s: int = HUMAN_PAUSE_TIMEOUT) -> str:
         return "skip"
     else:
         return ""
+
+
+async def detect_captcha_quick(page) -> bool:
+    """Fast detect captcha by URL patterns."""
+    try:
+        await asyncio.sleep(1)
+        u = (page.url or "").lower()
+        print("page url:")
+        print(u)
+        if any(p in u for p in _CAP_PATTERNS):
+            return True
+    except Exception:
+        pass
+    try:
+        for fr in page.frames:
+            fu = (fr.url or "").lower()
+            if any(p in fu for p in _CAP_PATTERNS):
+                return True
+    except Exception:
+        pass
+    return False
+
+async def pause_if_captcha_then_screenshot(page,wait_for_human):
+    """
+    found captcha -> wait for user handling -> return screenshot bits after resolved
+    No captcha -> return None
+    
+    """
+    if not await detect_captcha_quick(page):
+        return None
+    print("[captcha] detected. Please complete the captcha in the browser, then press Enter to continue...")
+    # input("After completing the captcha, press Enter to continue...")
+    await wait_for_human(reason="captcha")
+    try:
+        return await page.screenshot(full_page=False)
+    except Exception:
+        return None
